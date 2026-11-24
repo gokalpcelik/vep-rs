@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Plugins
+  - The dbNSFP plugin under `transcript_match=1` takes, for a transcript-specific column whose entry for the row's transcript is `.`, the entry of another transcript with the same `HGVSc_VEP` value that has data, and treats the `MutationTaster_*`, `dbNSFP_POPMAX_*` and `AllofUs_POPMAX_*` columns as transcript-specific.
 - Documentation, test corpora and comparison tools
   - The installation, limitations and workflow-managers pages state the Bioconda package `vep-rs`, its install line and that the channel's version can trail a release. (#117)
   - The installation page's Windows row names the container image under Docker before the Linux archive under WSL2; neither is tested on Windows. (#117)

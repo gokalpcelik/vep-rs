@@ -17,7 +17,7 @@
 //! | `consequence=` | `ALL`, or SO terms joined by `&`; by default a row is annotated when its consequences include `missense_variant`, `stop_lost`, `stop_gained` or `start_lost` (dbNSFP.pm:157, 290-292, 591-597) |
 //! | `output_prefix=` | truthy prefixes every output name with `dbNSFP_` (dbNSFP.pm:159, 257-261, 582) |
 //! | `pep_match=` | on by default: a record's `aaref`/`aaalt` (`X` read as `*`) must equal the row's amino acid change (dbNSFP.pm:340-344, 583, 605-611) |
-//! | `transcript_match=` | truthy keeps, in a `;`-joined transcript-specific column, the entry of the row's transcript alone (dbNSFP.pm:350-390, 584) |
+//! | `transcript_match=` | truthy keeps, in a `;`-joined transcript-specific column, the entry of the row's transcript alone, or, when that entry is `.`, the entry of another transcript with the same `HGVSc_VEP` value that has data (dbNSFP.pm:350-390, 584; the fallback is the modified plugin's, dbNSFP.pm:410-418) |
 //!
 //! A record matches on position and the alternate allele, on the forward
 //! strand (dbNSFP.pm:299-303, 335-338); only a single-base substitution whose
@@ -106,20 +106,11 @@ const DETECTION_REGION: (&str, u64, u64) = ("1", 1_008_170, 1_082_927);
 /// `;`-separated columns whose entries follow no transcript, or not the
 /// transcripts of `Ensembl_transcriptid` (dbNSFP.pm:166-181).
 const NON_TRANSCRIPT_SPECIFIC: &[&str] = &[
-    "MutationTaster_score",
-    "MutationTaster_converted_rankscore",
-    "MutationTaster_pred",
-    "MutationTaster_model",
     "Interpro_domain",
     "MutPred_Top5features",
     "Transcript_id_VEST3",
     "Transcript_var_VEST3",
     "VEST3_score",
-    "dbNSFP_POPMAX_AC",
-    "dbNSFP_POPMAX_POP",
-    "AllofUs_POPMAX_AC",
-    "AllofUs_POPMAX_AN",
-    "AllofUs_POPMAX_POP",
 ];
 /// The value written for a selected column the header lacks (dbNSFP.pm:404).
 const INVALID_FIELD: &str = "invalid_field";
@@ -201,6 +192,8 @@ pub struct DbNsfpPlugin {
     alt_col: usize,
     /// Column of `Ensembl_transcriptid`.
     transcript_id_col: usize,
+    /// Column of `HGVSc_VEP`, whose entries pair with those of `Ensembl_transcriptid`.
+    hgvsc_col: Option<usize>,
     /// Columns of the reference and alternate amino acids, read under `pep_match`.
     aaref_col: Option<usize>,
     aaalt_col: Option<usize>,
@@ -231,6 +224,7 @@ impl DbNsfpPlugin {
             pos_col: 0,
             alt_col: 0,
             transcript_id_col: 0,
+            hgvsc_col: None,
             aaref_col: None,
             aaalt_col: None,
             filter: ConsequenceFilter::Terms(DEFAULT_CONSEQUENCES.to_vec()),
@@ -317,6 +311,15 @@ impl DbNsfpPlugin {
             Vec::new()
         };
         let transcript_index = transcript_ids.iter().position(|id| *id == transcript_id);
+        // The row's `HGVSc_VEP` entries, read under `transcript_match` alone
+        // (modified dbNSFP.pm:373-380).
+        let hgvsc_ids: Vec<&str> = match self.hgvsc_col {
+            Some(col) if self.transcript_match => record
+                .columns
+                .get(col)
+                .map_or_else(Vec::new, |ids| split_entries(ids)),
+            _ => Vec::new(),
+        };
         let mut fields = IndexMap::with_capacity(self.selected.len());
         // A cell past the row's last filled one is undefined and skipped
         // (dbNSFP.pm:428-431, :407); an empty cell before it is the empty
@@ -359,6 +362,19 @@ impl DbNsfpPlugin {
                     ));
                 } else {
                     value = entries[transcript_index];
+                    // An empty entry falls back to the entry of another transcript with the
+                    // same `HGVSc_VEP` value that has data (modified dbNSFP.pm:410-418).
+                    if value == "." {
+                        if let Some(own) = hgvsc_ids.get(transcript_index) {
+                            if let Some(better) = hgvsc_ids
+                                .iter()
+                                .zip(&entries)
+                                .find(|(id, entry)| *id == own && **entry != ".")
+                            {
+                                value = better.1;
+                            }
+                        }
+                    }
                 }
             }
             // The transcript's own entry is tested against `.` as the whole
@@ -995,6 +1011,7 @@ impl BuiltinPlugin for DbNsfpPlugin {
         self.pos_col = start_col;
         self.alt_col = self.column("alt").unwrap_or(0);
         self.transcript_id_col = self.column("Ensembl_transcriptid").unwrap_or(0);
+        self.hgvsc_col = self.column("HGVSc_VEP");
         self.descriptions = readme_descriptions(&path);
         let transcript_specific = self.detect_transcript_specific(store.as_ref())?;
 
@@ -1520,14 +1537,11 @@ mod tests {
             pairs(&got[0]),
             [
                 ("SIFT_score", "0.02"),
-                ("MutationTaster_score", "1,0.5"),
+                ("MutationTaster_score", "0.5"),
                 ("GERP++_RS", "4.5")
             ]
         );
-        assert_eq!(
-            pairs(&got[1]),
-            [("MutationTaster_score", "1,0.5"), ("GERP++_RS", "4.5")]
-        );
+        assert_eq!(pairs(&got[1]), [("GERP++_RS", "4.5")]);
         let mut g = variant("G");
         let got = annotated(
             &plugin,
@@ -1538,6 +1552,66 @@ mod tests {
             got[0].get("SIFT_score").map(String::as_str),
             Some("0.3,0.4,0.5")
         );
+    }
+
+    /// Under `transcript_match=1` a `.` entry of the row's transcript is replaced by
+    /// the entry of another transcript with the same `HGVSc_VEP` value that has data;
+    /// each column falls back on its own, and an entry with data is kept
+    /// (modified dbNSFP.pm:373-420).
+    #[test]
+    fn transcript_match_falls_back_on_the_same_hgvsc() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = "#chr\tpos(1-based)\tref\talt\taaref\taaalt\tEnsembl_transcriptid\tHGVSc_VEP\tSIFT_score\tSIFT_pred";
+        let detection = "1\t1045000\tA\tG\tA\tG\tENST1;ENST2\tc.1A>G;c.2A>G\t0.1;0.2\tD;T";
+        let rows = [
+            "21\t100\tA\tC\tR\tG\tENST1;ENST2;ENST3\tc.5A>C;c.5A>C;c.6A>C\t.;0.2;.\tD;.;T",
+            "21\t100\tA\tG\tR\tW\tENST1;ENST2\tc.5A>G;c.6A>G\t.;0.2\tD;T",
+        ];
+        let mut lines = vec![header, detection];
+        lines.extend(rows);
+        let file = write_tabix_fixture(
+            dir.path(),
+            "dbNSFP4.9a_grch38_synthetic.gz",
+            &lines,
+            IndexSpec::standard(),
+        )
+        .to_string_lossy()
+        .to_string();
+        let plugin = load(
+            Some(Assembly::Grch38),
+            &[
+                &file,
+                "transcript_match=1",
+                "pep_match=0",
+                "SIFT_score",
+                "SIFT_pred",
+            ],
+        )
+        .unwrap();
+        let mut c = variant("C");
+        let got = annotated(
+            &plugin,
+            &mut c,
+            vec![
+                consequence("ENST1", Consequence::MissenseVariant, None),
+                consequence("ENST2", Consequence::MissenseVariant, None),
+                consequence("ENST3", Consequence::MissenseVariant, None),
+            ],
+        );
+        // ENST1 borrows ENST2's SIFT_score (same HGVSc), and keeps its own SIFT_pred.
+        assert_eq!(pairs(&got[0]), [("SIFT_score", "0.2"), ("SIFT_pred", "D")]);
+        // ENST2's own SIFT_pred is `.`, so it takes ENST1's, which shares c.5A>C.
+        assert_eq!(pairs(&got[1]), [("SIFT_score", "0.2"), ("SIFT_pred", "D")]);
+        // ENST3 has no other transcript with its HGVSc, so its `.` stays empty.
+        assert_eq!(pairs(&got[2]), [("SIFT_pred", "T")]);
+        let mut g = variant("G");
+        let got = annotated(
+            &plugin,
+            &mut g,
+            vec![consequence("ENST1", Consequence::MissenseVariant, None)],
+        );
+        // No other transcript shares ENST1's HGVSc: the `.` stays empty.
+        assert_eq!(pairs(&got[0]), [("SIFT_pred", "D")]);
     }
 
     /// `;` becomes `,` and `|` becomes `&` in every value by default (dbNSFP.pm:550-551,
